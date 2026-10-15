@@ -30,7 +30,6 @@
 #include "qemu/log.h"
 #include "qemu/timer.h"
 #include <inttypes.h>
-#include "qemu/clock.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "hw/gpio/rza1l_gpio.h"
@@ -68,7 +67,7 @@ static const RzA1lEncoderMap rza1l_encoder_map[DELUGE_ENC_COUNT] = {
 
 /*
  * Acknowledge a pending edge-mode external IRQ when its handler reads the
- * the encoder pins through PPR1. Some firmwares configure the encoder IRQs as
+ * encoder pins through PPR1. Some firmwares configure the encoder IRQs as
  * edge-detect (ICR1 != 0) and acknowledge only at the GIC, never writing
  * IRQRR; for those the level-held line must be released some other way or the
  * CPU storms on re-pend after every EOI. The ISR reads the encoder's A/B pins
@@ -93,11 +92,26 @@ static void rza1l_gpio_irq_read_ack(RzA1lGpioState *s, unsigned port,
 
         if ((s->irqrr & bit) && field != 0 &&
             (m->irq_pin / 8u) == byte_in_word) {
+            /* Clear the pending IRQ bit and deassert the line (ISR read-ack). */
             s->irqrr &= (uint16_t)~bit;
             qemu_set_irq(s->irq[m->irq_num], 0);
             qemu_log_mask(LOG_INFO,
                           "rza1l-gpio: read-ack enc=%u IRQn=%u irqrr=0x%04x t=%" PRIu64 "\n",
                           e, m->irq_num, s->irqrr, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+
+            /* If we deferred the companion B update for this encoder, apply it
+             * now: the ISR just read PPR and therefore sampled the B-side at
+             * the A-edge. Applying B after the ISR read preserves correct
+             * quadrature decoding semantics.
+             */
+            if (s->pending_b_set[e]) {
+                rza1l_gpio_set_input_pin(s, 1, m->comp_pin,
+                                         (bool)s->pending_b_val[e]);
+                qemu_log_mask(LOG_INFO,
+                              "rza1l-gpio: applied pending B enc=%u val=%u t=%" PRIu64 "\n",
+                              e, s->pending_b_val[e], qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                s->pending_b_set[e] = 0;
+            }
         }
     }
 }
@@ -164,6 +178,12 @@ static void rza1l_gpio_write(void *opaque, hwaddr offset, uint64_t value,
     }
 }
 
+/* Forward declaration: used by irq-read / apply-edge helpers before the
+ * function's static definition further down this file.
+ */
+static void rza1l_gpio_set_input_pin(RzA1lGpioState *s, unsigned port,
+                                     unsigned pin, bool level);
+
 /* Drive a host-controlled input pin level on a given port (1-based). */
 static void rza1l_gpio_set_input_pin(RzA1lGpioState *s, unsigned port,
                                      unsigned pin, bool level)
@@ -226,24 +246,49 @@ static void rza1l_gpio_apply_edge(RzA1lGpioState *s, unsigned enc, int dir)
     new_a = ((new_phase + 1) >> 1) & 1;
     new_b = (new_phase >> 1) & 1;
 
+    /* Log the computed transition with timestamp so we can correlate events. */
     qemu_log_mask(LOG_INFO,
                   "rza1l-gpio: apply_edge start enc=%u dir=%+d old_phase=%u new_phase=%u old_a=%u new_a=%u new_b=%u t=%" PRIu64 "\n",
                   enc, dir, old_phase, new_phase, old_a, new_a, new_b,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
-    rza1l_gpio_set_input_pin(s, 1, m->irq_pin, new_a);
-    rza1l_gpio_set_input_pin(s, 1, m->comp_pin, new_b);
-
-    s->enc_phase &= (uint16_t)~(0x3u << (2u * enc));
-    s->enc_phase |= (uint16_t)(new_phase << (2u * enc));
-
-    /* Only an A-pin transition is an IRQ edge; B-only steps are silent. */
+    /*
+     * To preserve guest-observed quadrature semantics we:
+     *  - apply the A transition immediately (this is the IRQ edge the ISR will see)
+     *  - defer applying the companion B transition until the ISR has sampled
+     *    PPR (handled in rza1l_gpio_irq_read_ack) or the guest acknowledges
+     *    the IRQRR bit in rza1l_intc_write.
+     * For B-only steps (A does not change) apply B immediately.
+     */
     if (new_a != old_a && m->irq_num < RZA1L_GPIO_NUM_IRQ) {
+        /* Apply A now (this is the edge the ISR will see). */
+        rza1l_gpio_set_input_pin(s, 1, m->irq_pin, new_a);
+
+        /* Update encoded phase immediately. */
+        s->enc_phase &= (uint16_t)~(0x3u << (2u * enc));
+        s->enc_phase |= (uint16_t)(new_phase << (2u * enc));
+
+        qemu_log_mask(LOG_INFO,
+                      "rza1l-gpio: A-edge enc=%u irq_pin=%u new_a=%u irqn=%u t=%" PRIu64 "\n",
+                      enc, m->irq_pin, new_a, m->irq_num,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+
+        /* Record that B must be applied after the ISR has sampled it. */
+        s->pending_b_set[enc] = 1;
+        s->pending_b_val[enc] = (uint8_t)new_b;
+
+        /* Raise the external IRQ line as the real hardware would. */
         s->irqrr |= (uint16_t)(1u << m->irq_num);
         qemu_set_irq(s->irq[m->irq_num], 1);
         qemu_log_mask(LOG_INFO,
                       "rza1l-gpio: raised IRQn=%u irqrr=0x%04x t=%" PRIu64 "\n",
                       m->irq_num, s->irqrr, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    } else {
+        /* No A-edge: apply the companion B immediately (B-only step). */
+        rza1l_gpio_set_input_pin(s, 1, m->comp_pin, new_b);
+
+        s->enc_phase &= (uint16_t)~(0x3u << (2u * enc));
+        s->enc_phase |= (uint16_t)(new_phase << (2u * enc));
     }
 }
 
@@ -255,13 +300,31 @@ static void rza1l_gpio_edge_cb(void *opaque)
         return; /* queue empty */
     }
 
+    /* Peek the next queued edge and defer it if we are waiting for the guest
+     * to sample a previous A-edge (i.e., if pending_b_set is set for this
+     * encoder). This guarantees we won't make a subsequent edge visible to the
+     * guest before the ISR had a chance to read the A-edge's B-side.
+     */
+    unsigned enc = s->edge_q[s->edge_head].enc;
+    int dir = s->edge_q[s->edge_head].dir;
+
+    if (s->pending_b_set[enc]) {
+        /* Defer: log and retry shortly; keep the same spacing so the guest gets time to ack. */
+        qemu_log_mask(LOG_INFO,
+                      "rza1l-gpio: deferring edge enc=%u because pending_b_set t=%" PRIu64 "\n",
+                      enc, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        timer_mod(s->edge_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                      RZA1L_GPIO_EDGE_SPACING_NS);
+        return;
+    }
+
     qemu_log_mask(LOG_INFO,
                   "rza1l-gpio: processing edge enc=%u dir=%+d queue_head=%d t=%" PRIu64 "\n",
-                  s->edge_q[s->edge_head].enc, s->edge_q[s->edge_head].dir, s->edge_head,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                  enc, dir, s->edge_head, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
-    rza1l_gpio_apply_edge(s, s->edge_q[s->edge_head].enc,
-                          s->edge_q[s->edge_head].dir);
+    /* Safe to dequeue and apply this edge. */
+    rza1l_gpio_apply_edge(s, enc, dir);
     s->edge_head = (s->edge_head + 1) % RZA1L_GPIO_EDGE_QUEUE;
 
     /* If more edges remain, schedule the next one after the ISR has run. */
@@ -372,7 +435,7 @@ static uint64_t rza1l_intc_read(void *opaque, hwaddr offset, unsigned size)
 }
 
 static void rza1l_intc_write(void *opaque, hwaddr offset, uint64_t value,
-                             unsigned size)
+                              unsigned size)
 {
     RzA1lGpioState *s = opaque;
 
@@ -396,6 +459,21 @@ static void rza1l_intc_write(void *opaque, hwaddr offset, uint64_t value,
         for (int n = 0; n < RZA1L_GPIO_NUM_IRQ; n++) {
             if (cleared & (1u << n)) {
                 qemu_set_irq(s->irq[n], 0);
+                /* After the firmware ACKs by writing IRQRR, apply any pending B
+                 * for encoders whose irq_num == n so the deferred companion
+                 * transition is not delayed indefinitely.
+                 */
+                for (unsigned e = 0; e < DELUGE_ENC_COUNT; e++) {
+                    const RzA1lEncoderMap *m = &rza1l_encoder_map[e];
+                    if (m->irq_num == (unsigned)n && s->pending_b_set[e]) {
+                        rza1l_gpio_set_input_pin(s, 1, m->comp_pin,
+                                                 (bool)s->pending_b_val[e]);
+                        s->pending_b_set[e] = 0;
+                        qemu_log_mask(LOG_INFO,
+                                      "rza1l-gpio: applied pending B (irqrr ack) enc=%u val=%u t=%" PRIu64 "\n",
+                                      e, s->pending_b_val[e], qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                    }
+                }
             }
         }
         break;
@@ -427,6 +505,11 @@ static void rza1l_gpio_reset(DeviceState *dev)
     s->irqrr_ack_seen = false;
     s->edge_head = 0;
     s->edge_tail = 0;
+    /* Clear any pending deferred-B updates. */
+    for (unsigned e = 0; e < DELUGE_ENC_COUNT; e++) {
+        s->pending_b_set[e] = 0;
+        s->pending_b_val[e] = 0;
+    }
     if (s->edge_timer) {
         timer_del(s->edge_timer);
     }
@@ -471,12 +554,14 @@ static void rza1l_gpio_unrealize(DeviceState *dev)
 
 static const VMStateDescription vmstate_rza1l_gpio = {
     .name = TYPE_RZA1L_GPIO,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(regs, RzA1lGpioState, RZA1L_GPIO_MMIO_SIZE),
         VMSTATE_UINT16_ARRAY(in_drive, RzA1lGpioState, RZA1L_GPIO_NUM_PORTS),
         VMSTATE_UINT16_ARRAY(in_mask, RzA1lGpioState, RZA1L_GPIO_NUM_PORTS),
+        VMSTATE_UINT8_ARRAY(pending_b_set, RzA1lGpioState, DELUGE_ENC_COUNT),
+        VMSTATE_UINT8_ARRAY(pending_b_val, RzA1lGpioState, DELUGE_ENC_COUNT),
         VMSTATE_UINT16(enc_phase, RzA1lGpioState),
         VMSTATE_UINT16(icr0, RzA1lGpioState),
         VMSTATE_UINT16(icr1, RzA1lGpioState),
