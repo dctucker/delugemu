@@ -29,6 +29,8 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/timer.h"
+#include <inttypes.h>
+#include "qemu/clock.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "hw/gpio/rza1l_gpio.h"
@@ -66,7 +68,7 @@ static const RzA1lEncoderMap rza1l_encoder_map[DELUGE_ENC_COUNT] = {
 
 /*
  * Acknowledge a pending edge-mode external IRQ when its handler reads the
- * encoder pins through PPR1. Some firmwares configure the encoder IRQs as
+ * the encoder pins through PPR1. Some firmwares configure the encoder IRQs as
  * edge-detect (ICR1 != 0) and acknowledge only at the GIC, never writing
  * IRQRR; for those the level-held line must be released some other way or the
  * CPU storms on re-pend after every EOI. The ISR reads the encoder's A/B pins
@@ -93,6 +95,9 @@ static void rza1l_gpio_irq_read_ack(RzA1lGpioState *s, unsigned port,
             (m->irq_pin / 8u) == byte_in_word) {
             s->irqrr &= (uint16_t)~bit;
             qemu_set_irq(s->irq[m->irq_num], 0);
+            qemu_log_mask(LOG_INFO,
+                          "rza1l-gpio: read-ack enc=%u IRQn=%u irqrr=0x%04x t=%" PRIu64 "\n",
+                          e, m->irq_num, s->irqrr, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         }
     }
 }
@@ -221,6 +226,11 @@ static void rza1l_gpio_apply_edge(RzA1lGpioState *s, unsigned enc, int dir)
     new_a = ((new_phase + 1) >> 1) & 1;
     new_b = (new_phase >> 1) & 1;
 
+    qemu_log_mask(LOG_INFO,
+                  "rza1l-gpio: apply_edge start enc=%u dir=%+d old_phase=%u new_phase=%u old_a=%u new_a=%u new_b=%u t=%" PRIu64 "\n",
+                  enc, dir, old_phase, new_phase, old_a, new_a, new_b,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+
     rza1l_gpio_set_input_pin(s, 1, m->irq_pin, new_a);
     rza1l_gpio_set_input_pin(s, 1, m->comp_pin, new_b);
 
@@ -231,6 +241,9 @@ static void rza1l_gpio_apply_edge(RzA1lGpioState *s, unsigned enc, int dir)
     if (new_a != old_a && m->irq_num < RZA1L_GPIO_NUM_IRQ) {
         s->irqrr |= (uint16_t)(1u << m->irq_num);
         qemu_set_irq(s->irq[m->irq_num], 1);
+        qemu_log_mask(LOG_INFO,
+                      "rza1l-gpio: raised IRQn=%u irqrr=0x%04x t=%" PRIu64 "\n",
+                      m->irq_num, s->irqrr, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     }
 }
 
@@ -241,6 +254,11 @@ static void rza1l_gpio_edge_cb(void *opaque)
     if (s->edge_head == s->edge_tail) {
         return; /* queue empty */
     }
+
+    qemu_log_mask(LOG_INFO,
+                  "rza1l-gpio: processing edge enc=%u dir=%+d queue_head=%d t=%" PRIu64 "\n",
+                  s->edge_q[s->edge_head].enc, s->edge_q[s->edge_head].dir, s->edge_head,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     rza1l_gpio_apply_edge(s, s->edge_q[s->edge_head].enc,
                           s->edge_q[s->edge_head].dir);
@@ -268,6 +286,11 @@ static void rza1l_gpio_enqueue_edge(RzA1lGpioState *s, unsigned enc, int dir)
     s->edge_q[s->edge_tail].enc = enc;
     s->edge_q[s->edge_tail].dir = dir;
     s->edge_tail = next;
+
+    /* Timestamped enqueue log for tracing timing races. */
+    qemu_log_mask(LOG_INFO,
+                  "rza1l-gpio: enqueued edge enc=%u dir=%+d queue=(%d->%d) t=%" PRIu64 "\n",
+                  enc, dir, s->edge_head, s->edge_tail, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     if (!timer_pending(s->edge_timer)) {
         timer_mod(s->edge_timer,

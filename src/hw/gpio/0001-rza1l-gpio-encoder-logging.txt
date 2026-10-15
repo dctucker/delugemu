@@ -1,0 +1,6 @@
+*** Added logging to rza1l GPIO encoder path
+
+This commit adds timestamped LOG_INFO traces for edge enqueue, edge application,
+IRQ raise, and read-ack so we can measure latencies and ordering when
+reproducing the encoder/wheel problem. Kept changes minimal to avoid
+behavioural side-effects.
